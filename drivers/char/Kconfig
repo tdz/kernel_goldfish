@@ -600,6 +600,13 @@ config DCC_TTY
 	tristate "DCC tty driver"
 	depends on ARM
 
+config GOLDFISH_NFC
+	tristate "Goldfish NFC driver"
+  depends on ARCH_GOLDFISH
+	default n
+	help
+	  NFC driver for Goldfish Virtual Platform.
+
 config GOLDFISH_TTY
 	tristate "Goldfish TTY Driver"
 	default n
