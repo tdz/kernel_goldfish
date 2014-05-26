@@ -46,9 +46,20 @@ struct nfc_msg {
 static struct nfc_msg *
 read_nfc_msg(const u8 __iomem *mem, gfp_t flags, unsigned char tag)
 {
+        static const unsigned char hdrlen[256] = {
+                [BCM2079x_BT_TAG] = 2,
+                [BCM2079x_NCI_TAG] = 3
+        };
+        static const unsigned char lenoff[256] = {
+                [BCM2079x_BT_TAG] = 2,
+                [BCM2079x_NCI_TAG] = 3
+        };
+
         struct nfc_msg *msg;
         size_t i;
         unsigned char len;
+
+        BUG_ON(!hdrlen[tag]);
 
         msg = kmalloc(sizeof(*msg)+NFC_MSG_BUFSIZ, flags);
         if (!msg)
@@ -60,12 +71,14 @@ read_nfc_msg(const u8 __iomem *mem, gfp_t flags, unsigned char tag)
         /* add tag for for bcm2079x driver */
         msg->buf[0] = tag;
 
-        for (i = 0; i < 3; ++i, ++msg->len) {
+        /* read header */
+        for (i = 0; i < hdrlen[tag]; ++i, ++msg->len) {
                 msg->buf[msg->len] = ioread8(mem+i);
         }
 
-        len = 3 + msg->buf[3]; /* header + payload length */
+        len = hdrlen[tag] + msg->buf[lenoff[tag]]; /* complete length */
 
+        /* read payload */
         for (; i < len; ++i, ++msg->len) {
                 BUG_ON(msg->len >= NFC_MSG_BUFSIZ);
                 msg->buf[msg->len] = ioread8(mem+i);
