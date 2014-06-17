@@ -28,6 +28,15 @@
 
 #define NFC_MSG_BUFSIZ 385 /* tag + register size */
 
+/* IOCTL constants */
+#define BCM2079x_MAGIC                          0xfa
+#define BCM2079x_POWER_CTL                      _IO(BCM2079x_MAGIC, 0x01)
+#define BCM2079x_CHANGE_ADDR                    _IO(BCM2079x_MAGIC, 0x02)
+#define BCM2079x_READ_FULL_PACKET               _IO(BCM2079x_MAGIC, 0x03)
+#define BCM2079x_SET_WAKE_ACTIVITY_STATE        _IO(BCM2079x_MAGIC, 0x04)
+#define BCM2079x_WAKE_CTL                       _IO(BCM2079x_MAGIC, 0x05)
+#define BCM2079x_READ_MULTI_PACKETS             _IO(BCM2079x_MAGIC, 0x06)
+
 struct nfc_msg {
         struct list_head list;
         unsigned long len;
@@ -37,9 +46,20 @@ struct nfc_msg {
 static struct nfc_msg *
 read_nfc_msg(const u8 __iomem *mem, gfp_t flags, unsigned char tag)
 {
+        static const unsigned char hdrlen[256] = {
+                [BCM2079x_BT_TAG] = 2,
+                [BCM2079x_NCI_TAG] = 3
+        };
+        static const unsigned char lenoff[256] = {
+                [BCM2079x_BT_TAG] = 2,
+                [BCM2079x_NCI_TAG] = 3
+        };
+
         struct nfc_msg *msg;
         size_t i;
         unsigned char len;
+
+        BUG_ON(!hdrlen[tag]);
 
         msg = kmalloc(sizeof(*msg)+NFC_MSG_BUFSIZ, flags);
         if (!msg)
@@ -51,12 +71,14 @@ read_nfc_msg(const u8 __iomem *mem, gfp_t flags, unsigned char tag)
         /* add tag for for bcm2079x driver */
         msg->buf[0] = tag;
 
-        for (i = 0; i < 3; ++i, ++msg->len) {
+        /* read header */
+        for (i = 0; i < hdrlen[tag]; ++i, ++msg->len) {
                 msg->buf[msg->len] = ioread8(mem+i);
         }
 
-        len = 3 + msg->buf[3]; /* header + payload length */
+        len = hdrlen[tag] + msg->buf[lenoff[tag]]; /* complete length */
 
+        /* read payload */
         for (; i < len; ++i, ++msg->len) {
                 BUG_ON(msg->len >= NFC_MSG_BUFSIZ);
                 msg->buf[msg->len] = ioread8(mem+i);
@@ -77,11 +99,13 @@ free_nfc_msg(struct nfc_msg *msg)
 enum {
         REG_STATUS = 0,
         REG_CTRL   = 1,
+        REG_PU     = 2,
+        REG_WS     = 3,
         REG_CMND   = 4,
         REG_RESP   = REG_OFFSET(REG_CMND),
         REG_NTFN   = REG_OFFSET(REG_RESP),
         REG_DATA   = REG_OFFSET(REG_NTFN),
-        REG_RESERVED2 = REG_OFFSET(REG_DATA)
+        REG_RESERVED0 = REG_OFFSET(REG_DATA)
 };
 
 enum {
@@ -249,6 +273,38 @@ static unsigned int goldfish_nfc_poll(struct file *f,
         return mask;
 }
 
+static long goldfish_nfc_unlocked_ioctl(struct file* f, unsigned int cmd,
+                                        unsigned long arg)
+{
+        struct goldfish_nfc *nfc;
+
+        nfc = f->private_data;
+
+        switch (cmd) {
+                case BCM2079x_POWER_CTL:
+                        /* signal power-up to device */
+                        iowrite8(arg, nfc->base+REG_PU);
+                        break;
+                case BCM2079x_WAKE_CTL:
+                        /* signal wake state to device */
+                        iowrite8(arg, nfc->base+REG_WS);
+                        break;
+                case BCM2079x_READ_FULL_PACKET:
+                case BCM2079x_READ_MULTI_PACKETS:
+                        /* nothing to do */
+                        break;
+                case BCM2079x_CHANGE_ADDR:
+                case BCM2079x_SET_WAKE_ACTIVITY_STATE:
+                        printk(KERN_ERR "FIXME: command %d not implemented\n", cmd);
+                        break;
+                default:
+                        printk(KERN_ERR "Unknown command %d\n", cmd);
+                        break;
+        }
+
+        return 0;
+}
+
 static int goldfish_nfc_open(struct inode *inode, struct file *f)
 {
         struct goldfish_nfc *nfc = container_of(inode->i_cdev,
@@ -271,6 +327,7 @@ static struct file_operations fops = {
         .read = goldfish_nfc_read,
         .write = goldfish_nfc_write,
         .poll = goldfish_nfc_poll,
+        .unlocked_ioctl = goldfish_nfc_unlocked_ioctl,
         .open = goldfish_nfc_open,
         .release = goldfish_nfc_release
 };
