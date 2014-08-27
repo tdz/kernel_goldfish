@@ -19,6 +19,7 @@
 #include <linux/poll.h>
 
 #define CDEV_NAME "bcm2079x"
+#define CDEV_NAME_HCI CDEV_NAME "_hci"
 #define CDEV_COUNT 1
 #define PDEV_NAME "goldfish_nfc"
 
@@ -146,6 +147,16 @@ struct goldfish_nfc {
         wait_queue_head_t w_wq;
         atomic_t rflag;
         atomic_t wflag;
+
+        /* HCI EVT_TRANSACTION */
+        dev_t dev_hci;
+        struct cdev cdev_hci;
+        struct class *class_hci;
+        struct device *device_hci;
+        struct list_head msgs_hci; /* protected by lock */
+        struct semaphore sem_hci;
+        wait_queue_head_t r_wq_hci;
+        atomic_t rflag_hci;
 };
 
 static struct goldfish_nfc _nfc[1];
@@ -332,12 +343,117 @@ static struct file_operations fops = {
         .release = goldfish_nfc_release
 };
 
+/*
+ * HCI EVT_TRANSACTION
+ */
+
+static ssize_t goldfish_nfc_read_hci(struct file *f, char __user *buf,
+                                     size_t len, loff_t *off)
+{
+        struct goldfish_nfc *nfc;
+        struct nfc_msg *msg;
+
+        nfc = f->private_data;
+
+        do {
+                if (!atomic_read(&nfc->rflag_hci)) {
+                        if (f->f_flags&O_NONBLOCK)
+                                return -EWOULDBLOCK;
+                        if (wait_event_interruptible(nfc->r_wq_hci, atomic_read(&nfc->rflag_hci) != 0))
+                                return -ERESTARTSYS;
+                }
+
+                spin_lock_bh(&nfc->lock);
+                if (!list_empty(&nfc->msgs_hci)) {
+                        msg = list_entry(nfc->msgs_hci.next, struct nfc_msg, list);
+                        if (len < msg->len) {
+                                spin_unlock_bh(&nfc->lock);
+                                printk(KERN_ERR "NFC read buffer too small\n");
+                                return -EMSGSIZE;
+                        }
+                        list_del(&msg->list);
+                        atomic_dec(&nfc->rflag_hci);
+                } else {
+                        msg = NULL;
+                }
+                spin_unlock_bh(&nfc->lock);
+        } while (!msg); /* concurrent read calls might have fetched the msg */
+
+        if (copy_to_user(buf, msg->buf, msg->len))
+                return -EFAULT;
+
+        len = msg->len;
+        free_nfc_msg(msg);
+
+        return len;
+}
+
+static unsigned int goldfish_nfc_poll_hci(struct file *f,
+                                          struct poll_table_struct *wait)
+{
+        struct goldfish_nfc *nfc;
+        unsigned int mask;
+
+        nfc = f->private_data;
+
+        down(&nfc->sem_hci);
+
+        poll_wait(f, &nfc->r_wq_hci, wait);
+
+        mask = 0;
+
+        spin_lock_bh(&nfc->lock);
+
+        if (atomic_read(&nfc->rflag_hci))
+                mask |= POLLIN|POLLRDNORM;
+
+        spin_unlock_bh(&nfc->lock);
+
+        up(&nfc->sem_hci);
+
+        return mask;
+}
+
+static int goldfish_nfc_open_hci(struct inode *inode, struct file *f)
+{
+        struct goldfish_nfc *nfc = container_of(inode->i_cdev,
+                                                struct goldfish_nfc,
+                                                cdev_hci);
+        f->private_data = nfc;
+
+        return 0;
+}
+
+static int goldfish_nfc_release_hci(struct inode *inode, struct file *f)
+{
+        f->private_data = NULL;
+
+        return 0;
+}
+
+static struct file_operations fops_hci = {
+        .owner = THIS_MODULE,
+        .read = goldfish_nfc_read_hci,
+        .poll = goldfish_nfc_poll_hci,
+        .open = goldfish_nfc_open_hci,
+        .release = goldfish_nfc_release_hci
+};
+
 struct irq_info {
         unsigned int flags;
         unsigned long reg;
         unsigned char tag;
         unsigned char rcv;
 };
+
+static int
+is_hci_evt_transaction(const struct nfc_msg* msg)
+{
+  /* We check if the RFU byte in the NCI data header is set to '1'. */
+  return (msg->buf[0] == BCM2079x_NCI_TAG) &&
+        !(msg->buf[1] & 0xe0) && /* is data message */
+         (msg->buf[2] == 1);
+}
 
 static void
 goldfish_nfc_irq_bh(unsigned long data)
@@ -350,7 +466,7 @@ goldfish_nfc_irq_bh(unsigned long data)
         };
 
         struct goldfish_nfc *nfc;
-        int r_wakeup, w_wakeup;
+        int r_wakeup, w_wakeup, r_wakeup_hci;
         u8 status;
         const struct irq_info* info;
         struct nfc_msg* msg;
@@ -358,6 +474,7 @@ goldfish_nfc_irq_bh(unsigned long data)
         nfc = _nfc + data;
         r_wakeup = 0;
         w_wakeup = 0;
+        r_wakeup_hci = 0;
         status = ioread8(nfc->base+REG_STATUS);
 
         if ( !(status&(STATUS_NCI_CMND|STATUS_HCI_CMND)) ) {
@@ -376,11 +493,18 @@ goldfish_nfc_irq_bh(unsigned long data)
                         break;
 
                 spin_lock(&nfc->lock);
-                list_add_tail(&msg->list, &nfc->msgs);
-                atomic_inc(&nfc->rflag);
+                if (is_hci_evt_transaction(msg)) {
+                  /* send HCI EVT_TRANSACTION to a separate device file */
+                  list_add_tail(&msg->list, &nfc->msgs_hci);
+                  atomic_inc(&nfc->rflag_hci);
+                  r_wakeup_hci = 1;
+                } else {
+                  list_add_tail(&msg->list, &nfc->msgs);
+                  atomic_inc(&nfc->rflag);
+                  r_wakeup = 1;
+                }
                 spin_unlock(&nfc->lock);
                 iowrite8(info->rcv, nfc->base+REG_CTRL);
-                r_wakeup = 1;
         }
 #undef ARRAY_END
 
@@ -389,6 +513,8 @@ goldfish_nfc_irq_bh(unsigned long data)
                 wake_up(&nfc->w_wq);
         if (r_wakeup)
                 wake_up(&nfc->r_wq);
+        if (r_wakeup_hci)
+                wake_up(&nfc->r_wq_hci);
 }
 
 DECLARE_TASKLET(goldfish_nfc_irq, goldfish_nfc_irq_bh, 0);
@@ -436,6 +562,11 @@ static int goldfish_nfc_probe(struct platform_device *pdev)
         atomic_set(&nfc->rflag, 0);
         atomic_set(&nfc->wflag, 1);
 
+        INIT_LIST_HEAD(&nfc->msgs_hci);
+        sema_init(&nfc->sem_hci, 1);
+        init_waitqueue_head(&nfc->r_wq_hci);
+        atomic_set(&nfc->rflag_hci, 0);
+
         r = platform_get_resource(pdev, IORESOURCE_MEM, 0);
         if (!r) {
                 res = -ENXIO;
@@ -481,6 +612,39 @@ static int goldfish_nfc_probe(struct platform_device *pdev)
                 goto err_device_create;
         }
 
+        /* HCI device */
+
+        res = alloc_chrdev_region(&nfc->dev_hci, CDEV_COUNT, 1, CDEV_NAME_HCI);
+        if (res < 0) {
+                dev_err(&pdev->dev,
+                        "alloc_chrdev_region failed with %d", res);
+                goto err_alloc_chrdev_region_hci;
+        }
+
+        cdev_init(&nfc->cdev_hci, &fops_hci);
+        nfc->cdev_hci.owner = fops_hci.owner;
+
+        res = cdev_add(&nfc->cdev_hci, nfc->dev_hci, 1);
+        if (res < 0) {
+                dev_err(&pdev->dev, "cdev_add failed with %d", res);
+                goto err_cdev_add_hci;
+        }
+
+        nfc->class_hci = class_create(THIS_MODULE, CDEV_NAME_HCI);
+        if (IS_ERR(nfc->class_hci)) {
+                res = PTR_ERR(nfc->class_hci);
+                dev_err(&pdev->dev, "class_create failed with %d", res);
+                goto err_class_create_hci;
+        }
+
+        nfc->device_hci = device_create(nfc->class_hci, NULL, nfc->dev_hci,
+                                        nfc, CDEV_NAME_HCI);
+        if (IS_ERR(nfc->device_hci)) {
+                res = PTR_ERR(nfc->device_hci);
+                dev_err(&pdev->dev, "device_create failed with %d", res);
+                goto err_device_create_hci;
+        }
+
         /* setup IRQ at the end to not get called during initialization */
 
         nfc->irq = platform_get_irq(pdev, 0);
@@ -501,6 +665,14 @@ static int goldfish_nfc_probe(struct platform_device *pdev)
 
 err_devm_request_irq:
 err_platform_get_irq:
+        device_destroy(nfc->class_hci, nfc->dev);
+err_device_create_hci:
+        class_destroy(nfc->class_hci);
+err_class_create_hci:
+        cdev_del(&nfc->cdev_hci);
+err_cdev_add_hci:
+        unregister_chrdev_region(nfc->dev_hci, 1);
+err_alloc_chrdev_region_hci:
         device_destroy(nfc->class, nfc->dev);
 err_device_create:
         class_destroy(nfc->class);
